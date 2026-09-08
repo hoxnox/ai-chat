@@ -13,7 +13,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from server import AgentTCPServer, ChatHTTPServer, Hub, Store  # noqa: E402
+from server import (  # noqa: E402
+    AgentTCPServer,
+    ChatHTTPServer,
+    Hub,
+    Store,
+    render_markdown,
+)
 
 
 class RunningService:
@@ -67,6 +73,60 @@ class RunningService:
     def assert_ok(response: dict) -> None:
         if not response.get("ok"):
             raise AssertionError(response)
+
+
+class MarkdownRenderingTest(unittest.TestCase):
+    def test_renders_common_markdown_blocks_and_inline_markup(self) -> None:
+        rendered = render_markdown(
+            "# План\n\n- первый шаг\n- второй **важный** шаг\n\n`go test ./...`"
+        )
+
+        self.assertIn("<h1>План</h1>", rendered)
+        self.assertIn("<ul><li>первый шаг</li><li>второй <strong>важный</strong> шаг</li></ul>", rendered)
+        self.assertIn("<p><code>go test ./...</code></p>", rendered)
+
+    def test_renders_fenced_code_with_escaped_contents(self) -> None:
+        rendered = render_markdown("```go\nif x < 3 {\n    fmt.Println(x)\n}\n```")
+
+        self.assertEqual(
+            rendered,
+            '<pre><code class="language-go">if x &lt; 3 {\n    fmt.Println(x)\n}</code></pre>',
+        )
+
+    def test_renders_markdown_tables(self) -> None:
+        rendered = render_markdown(
+            "| Файл | Изменение |\n| --- | --- |\n| `handler.go` | **30s** |"
+        )
+
+        self.assertEqual(
+            rendered,
+            "<table><thead><tr><th>Файл</th><th>Изменение</th></tr></thead>"
+            "<tbody><tr><td><code>handler.go</code></td><td><strong>30s</strong></td></tr></tbody></table>",
+        )
+
+    def test_links_are_clickable_without_allowing_raw_html_or_javascript(self) -> None:
+        rendered = render_markdown(
+            "[issue](https://src.devment.tech/srv/scanner/issues/128) "
+            "[bad](javascript:alert(1)) <script>alert(2)</script>"
+        )
+
+        self.assertIn(
+            '<a href="https://src.devment.tech/srv/scanner/issues/128" target="_blank" rel="noopener noreferrer">issue</a>',
+            rendered,
+        )
+        self.assertNotIn('href="javascript:', rendered)
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("&lt;script&gt;alert(2)&lt;/script&gt;", rendered)
+
+    def test_renders_ordered_lists(self) -> None:
+        rendered = render_markdown("1. проверить код\n2. добавить тест")
+
+        self.assertEqual(rendered, "<ol><li>проверить код</li><li>добавить тест</li></ol>")
+
+    def test_does_not_activate_markdown_links_inside_code_spans(self) -> None:
+        rendered = render_markdown("`[issue](https://example.com/1)`")
+
+        self.assertEqual(rendered, "<p><code>[issue](https://example.com/1)</code></p>")
 
 
 class ChatIntegrationTest(unittest.TestCase):
@@ -136,6 +196,15 @@ class ChatIntegrationTest(unittest.TestCase):
             payload = json.load(response)
         self.assertEqual(payload["messages"][-1]["sender"], "claude-one")
         self.assertEqual(payload["messages"][-1]["body"], "Reply")
+        self.assertEqual(payload["messages"][-1]["body_html"], "<p>Reply</p>")
+
+    def test_web_ui_uses_server_rendered_markdown(self) -> None:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.service.http_port}/", timeout=2) as response:
+            page = response.read().decode()
+
+        self.assertIn("body.innerHTML=m.body_html", page)
+        self.assertIn(".body pre", page)
+        self.assertIn(".body table", page)
 
     def test_agent_history_advances_its_unread_cursor(self) -> None:
         self.service.request("codex-one", {"op": "create", "chat": "review"})

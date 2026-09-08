@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 import signal
 import socketserver
 import sqlite3
@@ -58,6 +59,133 @@ def clean_text(value: object) -> str:
     if len(value) > MAX_TEXT:
         raise ChatError(f"text is longer than {MAX_TEXT} characters")
     return value
+
+
+def render_inline_markdown(text: str) -> str:
+    """Render a deliberately small, HTML-safe subset of inline Markdown."""
+    code_spans: list[str] = []
+    links: list[str] = []
+
+    def save_link(match: re.Match[str]) -> str:
+        label, url = match.group(1), match.group(2).strip()
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in {"http", "https", "mailto"}:
+            return match.group(0)
+        links.append(
+            f'<a href="{html.escape(url, quote=True)}" target="_blank" '
+            f'rel="noopener noreferrer">{render_inline_markdown(label)}</a>'
+        )
+        return f"\x00LINK{len(links) - 1}\x00"
+
+    def save_code(match: re.Match[str]) -> str:
+        code_spans.append(f"<code>{html.escape(match.group(1))}</code>")
+        return f"\x00CODE{len(code_spans) - 1}\x00"
+
+    rendered = re.sub(r"`([^`\n]+)`", save_code, text)
+    rendered = re.sub(r"\[([^]\n]+)\]\(([^)\s]+)\)", save_link, rendered)
+    rendered = html.escape(rendered)
+    rendered = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", rendered)
+    rendered = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", rendered)
+    for index, code in enumerate(code_spans):
+        rendered = rendered.replace(f"\x00CODE{index}\x00", code)
+    for index, link in enumerate(links):
+        rendered = rendered.replace(f"\x00LINK{index}\x00", link)
+    return rendered
+
+
+def render_markdown(text: str) -> str:
+    """Render message Markdown without trusting raw HTML from participants."""
+    lines = text.splitlines()
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+
+        fence = re.match(r"^```([A-Za-z0-9_+-]*)\s*$", line)
+        if fence:
+            language = fence.group(1)
+            index += 1
+            code_lines: list[str] = []
+            while index < len(lines) and not re.match(r"^```\s*$", lines[index]):
+                code_lines.append(lines[index])
+                index += 1
+            if index < len(lines):
+                index += 1
+            language_attr = f' class="language-{language}"' if language else ""
+            output.append(
+                f"<pre><code{language_attr}>{html.escape(chr(10).join(code_lines))}</code></pre>"
+            )
+            continue
+
+        if index + 1 < len(lines) and "|" in line:
+            header_cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            separator_cells = [cell.strip() for cell in lines[index + 1].strip().strip("|").split("|")]
+            if (
+                len(header_cells) == len(separator_cells)
+                and len(header_cells) > 1
+                and all(re.fullmatch(r":?-{3,}:?", cell) for cell in separator_cells)
+            ):
+                index += 2
+                rows: list[list[str]] = []
+                while index < len(lines) and "|" in lines[index] and lines[index].strip():
+                    cells = [cell.strip() for cell in lines[index].strip().strip("|").split("|")]
+                    if len(cells) != len(header_cells):
+                        break
+                    rows.append(cells)
+                    index += 1
+                header_html = "".join(
+                    f"<th>{render_inline_markdown(cell)}</th>" for cell in header_cells
+                )
+                rows_html = "".join(
+                    "<tr>" + "".join(f"<td>{render_inline_markdown(cell)}</td>" for cell in row) + "</tr>"
+                    for row in rows
+                )
+                output.append(f"<table><thead><tr>{header_html}</tr></thead><tbody>{rows_html}</tbody></table>")
+                continue
+
+        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if heading:
+            level = len(heading.group(1))
+            output.append(f"<h{level}>{render_inline_markdown(heading.group(2))}</h{level}>")
+            index += 1
+            continue
+
+        unordered = re.match(r"^\s*[-+*]\s+(.+)$", line)
+        if unordered:
+            items: list[str] = []
+            while index < len(lines):
+                item = re.match(r"^\s*[-+*]\s+(.+)$", lines[index])
+                if not item:
+                    break
+                items.append(f"<li>{render_inline_markdown(item.group(1))}</li>")
+                index += 1
+            output.append("<ul>" + "".join(items) + "</ul>")
+            continue
+
+        ordered = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
+        if ordered:
+            items = []
+            while index < len(lines):
+                item = re.match(r"^\s*\d+[.)]\s+(.+)$", lines[index])
+                if not item:
+                    break
+                items.append(f"<li>{render_inline_markdown(item.group(1))}</li>")
+                index += 1
+            output.append("<ol>" + "".join(items) + "</ol>")
+            continue
+
+        paragraph = [line]
+        index += 1
+        while index < len(lines) and lines[index].strip():
+            if re.match(r"^(#{1,6})\s+|^\s*[-+*]\s+|^\s*\d+[.)]\s+", lines[index]):
+                break
+            paragraph.append(lines[index])
+            index += 1
+        output.append("<p>" + "<br>".join(render_inline_markdown(item) for item in paragraph) + "</p>")
+    return "".join(output)
 
 
 class Store:
@@ -466,7 +594,21 @@ INDEX_HTML = r"""<!doctype html>
     .message { max-width:850px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 13px }
     .message.system { color:var(--muted); background:transparent; border-style:dashed }
     .meta { color:var(--muted); font-size:12px; margin-bottom:5px }
-    .body { white-space:pre-wrap; overflow-wrap:anywhere }
+    .body { overflow-wrap:anywhere }
+    .body > :first-child { margin-top:0 }
+    .body > :last-child { margin-bottom:0 }
+    .body h1,.body h2,.body h3,.body h4,.body h5,.body h6 { line-height:1.25; margin:1em 0 .45em }
+    .body h1 { font-size:1.55em } .body h2 { font-size:1.35em } .body h3 { font-size:1.18em }
+    .body p { margin:.65em 0 }
+    .body ul,.body ol { margin:.65em 0; padding-left:1.6em }
+    .body li + li { margin-top:.3em }
+    .body code { padding:.12em .35em; border-radius:5px; background:#0c0f15; font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace }
+    .body pre { overflow:auto; margin:.8em 0; padding:12px; border:1px solid var(--line); border-radius:8px; background:#0c0f15 }
+    .body pre code { padding:0; background:transparent; white-space:pre }
+    .body table { display:block; max-width:100%; overflow:auto; margin:.8em 0; border-collapse:collapse }
+    .body th,.body td { padding:7px 10px; border:1px solid var(--line); text-align:left; vertical-align:top }
+    .body th { background:#252b37 }
+    .body a { color:#9db3ff }
     form { border-top:1px solid var(--line); padding:14px 20px; display:grid; grid-template-columns:150px 1fr auto; gap:9px; align-items:end }
     textarea { resize:vertical; min-height:44px; max-height:180px }
     .empty { color:var(--muted); margin:auto }
@@ -505,7 +647,7 @@ async function selectRoom(room){state.room=room;state.after=0;messagesEl.replace
 function appendMessage(m){
   const box=document.createElement('article');box.className='message '+m.kind;
   const meta=document.createElement('div');meta.className='meta';meta.textContent=`#${m.id} · ${m.sender} · ${new Date(m.created_at).toLocaleString()}`;
-  const body=document.createElement('div');body.className='body';body.textContent=m.body;
+  const body=document.createElement('div');body.className='body';body.innerHTML=m.body_html;
   box.append(meta,body);messagesEl.append(box);state.after=Math.max(state.after,m.id);messagesEl.scrollTop=messagesEl.scrollHeight;
 }
 async function loadMessages(){if(!state.room)return;const data=await api(roomUrl(state.room,`/messages?after=${state.after}`));for(const m of data.messages)appendMessage(m)}
@@ -577,6 +719,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 messages = self.server.hub.store.history(
                     room, int(query.get("after", [0])[0]), int(query.get("limit", [500])[0])
                 )
+                for message in messages:
+                    message["body_html"] = render_markdown(message["body"])
                 self.json_response(HTTPStatus.OK, {"messages": messages})
                 return
             if resource == "members":
